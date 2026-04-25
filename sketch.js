@@ -4,17 +4,17 @@ let handPose;
 let results;
 let hands = [];
 
-// Session State
+let wallImage;
 let isCountingDown = false;
 let isSessionActive = false;
 let timerStart = 0;
 let photosTakenInSession = 0;
 let photoBatch = [];
-
-// Wall Frames
 let frames = [];
 
 function preload() {
+    // Ensure this matches your file name exactly!
+    wallImage = loadImage('gallery_image.png');
     bodySegmentation = ml5.bodySegmentation("SelfieSegmentation", { maskType: "background" });
     handPose = ml5.handPose();
 }
@@ -28,22 +28,21 @@ function setup() {
     bodySegmentation.detectStart(video, (res) => { results = res; });
     handPose.detectStart(video, (res) => { hands = res; });
 
-    // Initialize 4 Frames (Adjust x, y, w, h to fit your projector wall)
-    let fw = 300;
-    let fh = 225;
-    frames.push({ x: width * 0.2 - fw / 2, y: height * 0.3 - fh / 2, w: fw, h: fh, occupied: false, images: [] });
-    frames.push({ x: width * 0.8 - fw / 2, y: height * 0.3 - fh / 2, w: fw, h: fh, occupied: false, images: [] });
-    frames.push({ x: width * 0.2 - fw / 2, y: height * 0.7 - fh / 2, w: fw, h: fh, occupied: false, images: [] });
-    frames.push({ x: width * 0.8 - fw / 2, y: height * 0.7 - fh / 2, w: fw, h: fh, occupied: false, images: [] });
+    // --- TUNE THESE NUMBERS ---
+    // Change these x, y, w, h values until the red debug boxes 
+    // sit perfectly inside your golden frames.
+    frames.push({ x: width * 0.23, y: height * 0.05, w: width * 0.28, h: height * 0.33, occupied: false, images: [] });
+    frames.push({ x: width * 0.72, y: height * 0.22, w: width * 0.24, h: height * 0.43, occupied: false, images: [] });
+    frames.push({ x: width * 0.03, y: height * 0.45, w: width * 0.23, h: height * 0.48, occupied: false, images: [] });
+    frames.push({ x: width * 0.36, y: height * 0.52, w: width * 0.27, h: height * 0.35, occupied: false, images: [] });
 }
 
 function draw() {
     background(0);
 
-    // 1. GESTURE CHECK
     checkFiveGesture();
 
-    // 2. LIVE CAMERA LAYER (Mirrored)
+    // LAYER 1: LIVE SELF (The Mirror)
     push();
     translate(width, 0);
     scale(-1, 1);
@@ -54,29 +53,43 @@ function draw() {
     }
     pop();
 
-    // 3. WALL FRAMES & HOVER ANIMATION
-    for (let f of frames) {
-        // Draw Frame Placeholder
-        noFill();
-        stroke(255, 50);
-        rect(f.x, f.y, f.w, f.h);
+    // LAYER 2: THE WALL (Only shows when not taking photos)
+    if (!isSessionActive) {
+        imageMode(CORNER);
+        image(wallImage, 0, 0, width, height);
 
-        if (f.occupied) {
+        // LAYER 3: STORED PHOTOS & HOVER LOGIC
+        for (let f of frames) {
             let isHovering = false;
+
             if (hands.length > 0) {
                 let tip = hands[0].keypoints[8];
+                // Map camera 640x480 to screen size
                 let hX = width - map(tip.x, 0, 640, 0, width);
                 let hY = map(tip.y, 0, 480, 0, height);
-                if (hX > f.x && hX < f.x + f.w && hY > f.y && hY < f.y + f.h) isHovering = true;
+
+                // --- THE GREEN DOT ---
+                // We draw this once per hand outside the loop if we wanted, 
+                // but drawing it here ensures it's on top of the wall.
+                fill(0, 255, 0);
+                noStroke();
+                circle(hX, hY, 15);
+
+                // Check if the mapped finger is inside the frame bounds
+                if (hX > f.x && hX < f.x + f.w && hY > f.y && hY < f.y + f.h) {
+                    isHovering = true;
+                }
             }
 
-            // Choose image: Cycle if hovering, otherwise show first
-            let imgToDisplay = isHovering ? f.images[floor(frameCount / 10) % 3] : f.images[0];
-            image(imgToDisplay, f.x, f.y, f.w, f.h);
+            if (f.occupied) {
+                // GIF Logic: Cycle 3 images if hovering, otherwise static
+                let imgToDisplay = isHovering ? f.images[floor(frameCount / 10) % 3] : f.images[0];
+                image(imgToDisplay, f.x, f.y, f.w, f.h);
+            }
         }
     }
 
-    // 4. UI: COUNTDOWN & SESSION INFO
+    // LAYER 4: UI COUNTDOWN
     if (isCountingDown) {
         let elapsed = millis() - timerStart;
         let sec = 3 - floor(elapsed / 1000);
@@ -84,10 +97,12 @@ function draw() {
         if (sec > 0) {
             textAlign(CENTER, CENTER);
             fill(255, 200, 0);
-            textSize(200);
+            textSize(250);
             text(sec, width / 2, height / 2);
+
             textSize(40);
-            text("GET READY: PHOTO " + (photosTakenInSession + 1) + " / 3", width / 2, height / 2 + 120);
+            fill(255);
+            text("PHOTO " + (photosTakenInSession + 1) + " / 3", width / 2, height / 2 + 150);
         } else {
             takePhoto();
             isCountingDown = false;
@@ -123,21 +138,20 @@ function takePhoto() {
         let img = video.get();
         img.mask(results.mask);
         photoBatch.push(img);
-        background(255); // Flash
+        background(255);
 
         if (photoBatch.length < 3) {
-            // Wait 1.5 seconds before starting next countdown
             setTimeout(startCountdown, 1500);
+            photosTakenInSession++;
         } else {
-            // Session Complete
             assignToFrame(photoBatch);
-            isSessionActive = false;
+            isSessionActive = false; // The wall will reappear now!
         }
     }
 }
 
 function assignToFrame(batch) {
-    // Find the first empty frame
+    // Look for the first empty frame to fill
     for (let f of frames) {
         if (!f.occupied) {
             f.images = batch;
