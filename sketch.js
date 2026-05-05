@@ -22,6 +22,30 @@ let frameFGs = []; // The front of the frames (with transparent centers)
 // --- Frame cycling logic ---
 let nextFrameIndex = 0;
 
+// --- ELEMENT PANEL VARIABLES ---
+let showElementPanel = false;
+let elementImages = [];    // { img, label }
+let activeElement = null;  // { img, label, w, h } — follows fingertip
+let placedElements = [];   // { img, x, y, w, h } — permanently on wall
+const PANEL_W  = 220;
+const ITEM_GAP = 12;  // gap between cards
+const LABEL_H  = 22;  // label below thumbnail
+
+// --- GESTURE STATE ---
+let wasPinching   = false;
+let lastPinchTime = 0;
+const PINCH_THRESHOLD = 55;
+const PINCH_COOLDOWN  = 1100;
+
+// --- DWELL (hover-to-pick-up) STATE ---
+let hoverElementIndex = -1;
+let hoverStartTime    = 0;
+const DWELL_TIME      = 900;
+
+// --- PANEL SCROLL STATE ---
+let panelScrollY      = 0;
+let lastFingerYPanel  = -1;
+
 // --- WAND & SPARKLE VARIABLES ---
 let num_of_sparkles = 1000;
 let sparklesX = [];
@@ -51,6 +75,11 @@ function preload() {
     frameBGs[3] = loadImage('./frame_background/Background 4.png');
     frameFGs[3] = loadImage('./frame_background/Frame 4.png'); // Must be a PNG with transparent center
     // =========================================================
+
+    // --- ELEMENT IMAGES ---
+    elementImages[0] = { img: loadImage('./elements/hat.png'),   label: 'Hat' };
+    elementImages[1] = { img: loadImage('./elements/owl.png'),   label: 'Owl' };
+    elementImages[2] = { img: loadImage('./elements/train.png'), label: 'Train' };
 
     bodySegmentation = ml5.bodySegmentation("SelfieSegmentation", { maskType: "background" });
     handPose = ml5.handPose();
@@ -90,6 +119,7 @@ function draw() {
     background(0);
 
     checkFiveGesture();
+    checkGestures();
 
     // LAYER 1: LIVE SELF (The Mirror)
     push();
@@ -138,6 +168,30 @@ function draw() {
         // --- NEW LAYER 2.5: THE FOREGROUND STAIRCASE ---
         // By drawing this AFTER the frames, it covers up any frames/photos underneath it
         image(staircaseImage, 0, height * 0.3, width, height);
+
+        // --- LAYER 2.6: PLACED ELEMENTS (on top of staircase so always visible) ---
+        imageMode(CORNER);
+        for (let el of placedElements) {
+            image(el.img, el.x - el.w / 2, el.y - el.h / 2, el.w, el.h);
+        }
+
+        // --- LAYER 2.7: ACTIVE ELEMENT — follows index fingertip ---
+        if (activeElement && hands.length > 0) {
+            let tip = hands[0].keypoints[8];
+            let hX  = width - map(tip.x, 0, 640, 0, width);
+            let hY  = map(tip.y,          0, 480, 0, height);
+
+            imageMode(CORNER);
+            image(activeElement.img, hX - activeElement.w / 2, hY - activeElement.h / 2, activeElement.w, activeElement.h);
+        }
+
+        // --- LAYER 2.8: ELEMENT PANEL ---
+        if (showElementPanel) {
+            drawElementPanel();
+        }
+
+        // --- LAYER 2.9: ADD ELEMENTS BUTTON ---
+        drawAddElementsButton();
 
         // LAYER 3.5: FALLING SPARKLES (Drawn over everything)
         noStroke();
@@ -221,12 +275,12 @@ function draw() {
 }
 
 function mousePressed() {
+    // Session cancel button (kept as a safety fallback during photo sessions)
     if (isSessionActive) {
-        let btnLeft = (width / 2) - 75;
-        let btnRight = (width / 2) + 75;
-        let btnTop = 60 - 25;
+        let btnLeft   = (width / 2) - 75;
+        let btnRight  = (width / 2) + 75;
+        let btnTop    = 60 - 25;
         let btnBottom = 60 + 25;
-
         if (mouseX > btnLeft && mouseX < btnRight && mouseY > btnTop && mouseY < btnBottom) {
             cancelSession();
         }
@@ -241,7 +295,7 @@ function cancelSession() {
 }
 
 function checkFiveGesture() {
-    if (hands.length > 0 && !isCountingDown && !isSessionActive) {
+    if (hands.length > 0 && !isCountingDown && !isSessionActive && !showElementPanel && !activeElement) {
         let hand = hands[0];
         let indexUp = hand.keypoints[8].y < hand.keypoints[6].y;
         let middleUp = hand.keypoints[12].y < hand.keypoints[10].y;
@@ -288,6 +342,309 @@ function assignToFrame(batch) {
     nextFrameIndex = (nextFrameIndex + 1) % frames.length;
 }
 
+function checkGestures() {
+    if (isSessionActive || hands.length === 0) {
+        wasPinching      = false;
+        hoverElementIndex = -1;
+        lastFingerYPanel  = -1;
+        return;
+    }
+
+    let tip   = hands[0].keypoints[8];
+    let thumb = hands[0].keypoints[4];
+    let hX = width - map(tip.x,   0, 640, 0, width);
+    let hY = map(tip.y,            0, 480, 0, height);
+    let tX = width - map(thumb.x,  0, 640, 0, width);
+    let tY = map(thumb.y,           0, 480, 0, height);
+
+    let pinching  = dist(hX, hY, tX, tY) < PINCH_THRESHOLD;
+    let pinchEdge = pinching && !wasPinching && (millis() - lastPinchTime > PINCH_COOLDOWN);
+
+    // ── Pinch: context-sensitive action ─────────────────────────
+    if (pinchEdge) {
+        if (activeElement) {
+            placeElement(hX, hY);
+        } else if (!showElementPanel) {
+            showElementPanel = true;
+            panelScrollY     = 0;
+        } else {
+            showElementPanel  = false;
+            hoverElementIndex = -1;
+        }
+        lastPinchTime = millis();
+    }
+    wasPinching = pinching;
+
+    let panelX  = width - PANEL_W - 5;
+    let panelY  = 70;
+    let panelH  = height - 80;
+    let headerH = 54;
+
+    // ── Panel scroll via finger drag ─────────────────────────────
+    if (showElementPanel && !activeElement && hX > panelX) {
+        if (lastFingerYPanel >= 0) {
+            let delta = lastFingerYPanel - hY; // up = positive = scroll down
+            if (abs(delta) > 1.5) {
+                panelScrollY = constrain(panelScrollY + delta, 0, maxPanelScroll());
+            }
+        }
+        lastFingerYPanel = hY;
+    } else {
+        lastFingerYPanel = -1;
+    }
+
+    // ── Dwell to pick up element ─────────────────────────────────
+    if (showElementPanel && !activeElement && !pinching) {
+        let thumbW  = PANEL_W - 28;
+        let startY  = panelY + headerH;
+
+        let found = -1;
+        for (let i = 0; i < elementImages.length; i++) {
+            let ty  = startY + itemOffset(i) - panelScrollY + 8;
+            let tH  = thumbH(i);
+            if (ty + tH < panelY + headerH) continue;
+            if (ty > panelY + panelH)       continue;
+            if (hX > panelX + 14 && hX < panelX + 14 + thumbW &&
+                hY > ty          && hY < ty + tH) {
+                found = i;
+                break;
+            }
+        }
+
+        if (found !== hoverElementIndex) {
+            hoverElementIndex = found;
+            hoverStartTime    = millis();
+        }
+
+        if (hoverElementIndex >= 0 && millis() - hoverStartTime >= DWELL_TIME) {
+            let idx = hoverElementIndex;
+            let placedW = 120;
+            let placedH = placedW * elementImages[idx].img.height / elementImages[idx].img.width;
+            activeElement = {
+                img:   elementImages[idx].img,
+                label: elementImages[idx].label,
+                w: placedW,
+                h: placedH
+            };
+            hoverElementIndex = -1;
+        }
+    } else if (!showElementPanel || pinching) {
+        hoverElementIndex = -1;
+    }
+}
+
+// Height of a single thumbnail scaled to fit the panel width
+function thumbH(i) {
+    let tw  = PANEL_W - 28;
+    let img = elementImages[i].img;
+    if (!img || img.width === 0) return 150;
+    return tw * img.height / img.width;
+}
+
+// Y offset (within scrollable area) of element i, relative to startY
+function itemOffset(i) {
+    let off = 0;
+    for (let j = 0; j < i; j++) off += thumbH(j) + ITEM_GAP + LABEL_H;
+    return off;
+}
+
+function maxPanelScroll() {
+    let headerH  = 54;
+    let panelH   = height - 80;
+    let contentH = itemOffset(elementImages.length) + 16;
+    return max(0, contentH - (panelH - headerH));
+}
+
 function windowResized() {
     resizeCanvas(windowWidth, windowHeight);
+}
+
+// ─── ELEMENT PANEL HELPERS ────────────────────────────────────────────────────
+
+function drawAddElementsButton() {
+    let label;
+    if (activeElement)       label = '✶  Pinch to place';
+    else if (showElementPanel) label = '✶  Pinch to close';
+    else                     label = '✶  Pinch to add elements';
+
+    push();
+    textSize(14);
+    let tw = textWidth(label) + 36;
+    let bH = 40;
+    let bX = width - tw - 12;
+    let bY = 12;
+    let r  = 7;
+
+    // Outer warm-gold glow layer (largest, most transparent)
+    noStroke();
+    fill(210, 165, 55, 18);
+    rect(bX - 3, bY - 3, tw + 6, bH + 6, r + 2);
+
+    // Main body — parchment-warm glass
+    fill(195, 155, 60, 45);
+    rect(bX, bY, tw, bH, r);
+
+    // Top edge highlight (simulates raised depth)
+    fill(240, 210, 120, 55);
+    rect(bX + 2, bY + 2, tw - 4, bH / 2 - 2, r - 1);
+
+    // Border — warm gold, matching frame colour
+    noFill();
+    stroke(210, 168, 58, 200);
+    strokeWeight(1.2);
+    rect(bX, bY, tw, bH, r);
+
+    // Inner inset line for extra depth
+    stroke(240, 200, 100, 60);
+    strokeWeight(0.6);
+    rect(bX + 3, bY + 3, tw - 6, bH - 6, r - 2);
+
+    // Text
+    fill(235, 200, 100);
+    noStroke();
+    textAlign(LEFT, CENTER);
+    textSize(14);
+    text(label, bX + 16, bY + bH / 2);
+    pop();
+}
+
+function drawElementPanel() {
+    let panelX  = width - PANEL_W - 5;
+    let panelY  = 70;
+    let panelH  = height - 80;
+    let thumbW  = PANEL_W - 28;
+    let headerH = 54;
+    let startY  = panelY + headerH;
+    let scrollH = panelH - headerH - 30;
+
+    push();
+    rectMode(CORNER);
+
+    // ── Panel shell ──────────────────────────────────────────────
+    noFill();
+    stroke(210, 168, 58, 35);
+    strokeWeight(7);
+    rect(panelX, panelY, PANEL_W, panelH, 12);
+
+    fill(185, 148, 52, 32);
+    stroke(210, 168, 58, 185);
+    strokeWeight(1.3);
+    rect(panelX, panelY, PANEL_W, panelH, 10);
+
+    fill(240, 205, 110, 22);
+    noStroke();
+    rect(panelX + 3, panelY + 3, PANEL_W - 6, headerH - 6, 8);
+
+    noFill();
+    stroke(240, 200, 100, 30);
+    strokeWeight(0.6);
+    rect(panelX + 4, panelY + 4, PANEL_W - 8, panelH - 8, 8);
+
+    // ── Header ───────────────────────────────────────────────────
+    fill(230, 190, 90);
+    noStroke();
+    textAlign(CENTER, CENTER);
+    textSize(15);
+    text('✦  Elements  ✦', panelX + PANEL_W / 2, panelY + headerH / 2);
+
+    stroke(210, 168, 58, 110);
+    strokeWeight(0.8);
+    line(panelX + 12, panelY + headerH, panelX + PANEL_W - 12, panelY + headerH);
+
+    // ── Clip scrollable content ───────────────────────────────────
+    drawingContext.save();
+    drawingContext.beginPath();
+    drawingContext.rect(panelX + 6, panelY + headerH + 2, PANEL_W - 12, scrollH);
+    drawingContext.clip();
+
+    for (let i = 0; i < elementImages.length; i++) {
+        let el  = elementImages[i];
+        let tH  = thumbH(i);                              // dynamic height
+        let ty  = startY + itemOffset(i) - panelScrollY + 8;
+        let cx  = panelX + 14 + thumbW / 2;
+        let cy  = ty + tH / 2;
+        let cardH = tH + LABEL_H + 6;
+
+        // Skip fully outside viewport
+        if (ty + cardH < panelY + headerH) continue;
+        if (ty > panelY + panelH)          continue;
+
+        let hovering = (i === hoverElementIndex);
+
+        // Card bg
+        fill(hovering ? 210 : 200, hovering ? 168 : 160, hovering ? 58 : 55, hovering ? 55 : 20);
+        noStroke();
+        rect(panelX + 10, ty - 4, thumbW + 4, cardH, 6);
+
+        // Card border
+        noFill();
+        stroke(210, 168, 58, hovering ? 200 : 80);
+        strokeWeight(hovering ? 1.3 : 0.7);
+        rect(panelX + 10, ty - 4, thumbW + 4, cardH, 6);
+
+        // Image — transparent PNG, CORNER mode, exact aspect ratio
+        imageMode(CORNER);
+        image(el.img, panelX + 14, ty, thumbW, tH);
+
+        // Dwell progress ring
+        if (hovering) {
+            let progress = constrain((millis() - hoverStartTime) / DWELL_TIME, 0, 1);
+            let ringR    = min(thumbW, tH) / 2 + 6;
+            noFill();
+            stroke(210, 168, 58, 50);
+            strokeWeight(4);
+            ellipse(cx, cy, ringR * 2, ringR * 2);
+            stroke(235, 195, 85, 235);
+            strokeWeight(4);
+            arc(cx, cy, ringR * 2, ringR * 2, -HALF_PI, -HALF_PI + TWO_PI * progress);
+        }
+
+        // Label
+        fill(230, 200, 110);
+        noStroke();
+        textAlign(CENTER, TOP);
+        textSize(12);
+        text(el.label, panelX + PANEL_W / 2, ty + tH + 4);
+    }
+
+    drawingContext.restore();
+
+    // ── Scrollbar ─────────────────────────────────────────────────
+    let maxScroll = maxPanelScroll();
+    if (maxScroll > 0) {
+        let trackH   = scrollH - 8;
+        let trackX   = panelX + PANEL_W - 8;
+        let trackY   = panelY + headerH + 4;
+        let thumbFrac = scrollH / (scrollH + maxScroll);
+        let thumbLen  = max(24, trackH * thumbFrac);
+        let thumbTop  = trackY + (panelScrollY / maxScroll) * (trackH - thumbLen);
+
+        stroke(210, 168, 58, 35);
+        strokeWeight(2);
+        line(trackX, trackY, trackX, trackY + trackH);
+
+        stroke(210, 168, 58, 170);
+        strokeWeight(3);
+        line(trackX, thumbTop, trackX, thumbTop + thumbLen);
+    }
+
+    // ── Hint ──────────────────────────────────────────────────────
+    fill(200, 170, 90, 160);
+    noStroke();
+    textAlign(CENTER, BOTTOM);
+    textSize(10);
+    text('Hover to pick up  ·  Pinch to place', panelX + PANEL_W / 2, panelY + panelH - 8);
+
+    pop();
+}
+
+function placeElement(x, y) {
+    placedElements.push({
+        img: activeElement.img,
+        x: x,
+        y: y,
+        w: activeElement.w,
+        h: activeElement.h
+    });
+    activeElement = null;
 }
